@@ -178,6 +178,10 @@ rosbag play your-bag.bag -r 3
     <img src="./config/doc/ouster-demo.gif" alt="drawing" width="300"/>
 </p>
 
+<p align='center'>
+    <img src="https://images.ctfassets.net/tjhl2s1515g8/Q4d1Wv9udf60jc94vfF5L/e7f1a18a7c4fa469b00b973afa2de05e/3_modular_1.png?w=1800&q=75" alt="drawing" width="300"/>
+</p>
+
 ## Paper 
 
 Thank you for citing [LIO-SAM (IROS-2020)](./config/doc/paper.pdf) if you use any of this code. 
