@@ -1,8 +1,7 @@
 #include "utility.h"
 #include "lio_sam/cloud_info.h"
 
-// Velodyne
-struct PointXYZIRT
+struct VelodynePointXYZIRT
 {
     PCL_ADD_POINT4D
     PCL_ADD_INTENSITY;
@@ -10,31 +9,31 @@ struct PointXYZIRT
     float time;
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 } EIGEN_ALIGN16;
-
-POINT_CLOUD_REGISTER_POINT_STRUCT (PointXYZIRT,  
+POINT_CLOUD_REGISTER_POINT_STRUCT (VelodynePointXYZIRT,
     (float, x, x) (float, y, y) (float, z, z) (float, intensity, intensity)
     (uint16_t, ring, ring) (float, time, time)
 )
 
-// Ouster
-// struct PointXYZIRT {
-//     PCL_ADD_POINT4D;
-//     float intensity;
-//     uint32_t t;
-//     uint16_t reflectivity;
-//     uint8_t ring;
-//     uint16_t noise;
-//     uint32_t range;
-//     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-// }EIGEN_ALIGN16;
+struct OusterPointXYZIRT {
+    PCL_ADD_POINT4D;
+    float intensity;
+    uint32_t t;
+    uint16_t reflectivity;
+    uint8_t ring;
+    uint16_t noise;
+    uint32_t range;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
+POINT_CLOUD_REGISTER_POINT_STRUCT(OusterPointXYZIRT,
+    (float, x, x) (float, y, y) (float, z, z) (float, intensity, intensity)
+    (uint32_t, t, t) (uint16_t, reflectivity, reflectivity)
+    (uint8_t, ring, ring) (uint16_t, noise, noise) (uint32_t, range, range)
+)
 
-// POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZIRT,
-//     (float, x, x) (float, y, y) (float, z, z) (float, intensity, intensity)
-//     (uint32_t, t, t) (uint16_t, reflectivity, reflectivity)
-//     (uint8_t, ring, ring) (uint16_t, noise, noise) (uint32_t, range, range)
-// )
+// Use the Velodyne point format as a common representation
+using PointXYZIRT = VelodynePointXYZIRT;
 
-const int queueLength = 500;
+const int queueLength = 2000;
 
 class ImageProjection : public ParamServer
 {
@@ -57,7 +56,7 @@ private:
 
     std::deque<sensor_msgs::PointCloud2> cloudQueue;
     sensor_msgs::PointCloud2 currentCloudMsg;
-    
+
     double *imuTime = new double[queueLength];
     double *imuRotX = new double[queueLength];
     double *imuRotY = new double[queueLength];
@@ -68,6 +67,7 @@ private:
     Eigen::Affine3f transStartInverse;
 
     pcl::PointCloud<PointXYZIRT>::Ptr laserCloudIn;
+    pcl::PointCloud<OusterPointXYZIRT>::Ptr tmpOusterCloudIn;
     pcl::PointCloud<PointType>::Ptr   fullCloud;
     pcl::PointCloud<PointType>::Ptr   extractedCloud;
 
@@ -81,8 +81,10 @@ private:
 
     lio_sam::cloud_info cloudInfo;
     double timeScanCur;
-    double timeScanNext;
+    double timeScanEnd;
     std_msgs::Header cloudHeader;
+
+    vector<int> columnIdnCountVec;
 
 
 public:
@@ -105,6 +107,7 @@ public:
     void allocateMemory()
     {
         laserCloudIn.reset(new pcl::PointCloud<PointXYZIRT>());
+        tmpOusterCloudIn.reset(new pcl::PointCloud<OusterPointXYZIRT>());
         fullCloud.reset(new pcl::PointCloud<PointType>());
         extractedCloud.reset(new pcl::PointCloud<PointType>());
 
@@ -137,6 +140,8 @@ public:
             imuRotY[i] = 0;
             imuRotZ[i] = 0;
         }
+
+        columnIdnCountVec.assign(N_SCAN, 0);
     }
 
     ~ImageProjection(){}
@@ -193,21 +198,44 @@ public:
     {
         // cache point cloud
         cloudQueue.push_back(*laserCloudMsg);
-
         if (cloudQueue.size() <= 2)
             return false;
-        else
-        {
-            currentCloudMsg = cloudQueue.front();
-            cloudQueue.pop_front();
-
-            cloudHeader = currentCloudMsg.header;
-            timeScanCur = cloudHeader.stamp.toSec();
-            timeScanNext = cloudQueue.front().header.stamp.toSec();
-        }
 
         // convert cloud
-        pcl::fromROSMsg(currentCloudMsg, *laserCloudIn);
+        currentCloudMsg = std::move(cloudQueue.front());
+        cloudQueue.pop_front();
+        if (sensor == SensorType::VELODYNE || sensor == SensorType::LIVOX)
+        {
+            pcl::moveFromROSMsg(currentCloudMsg, *laserCloudIn);
+        }
+        else if (sensor == SensorType::OUSTER)
+        {
+            // Convert to Velodyne format
+            pcl::moveFromROSMsg(currentCloudMsg, *tmpOusterCloudIn);
+            laserCloudIn->points.resize(tmpOusterCloudIn->size());
+            laserCloudIn->is_dense = tmpOusterCloudIn->is_dense;
+            for (size_t i = 0; i < tmpOusterCloudIn->size(); i++)
+            {
+                auto &src = tmpOusterCloudIn->points[i];
+                auto &dst = laserCloudIn->points[i];
+                dst.x = src.x;
+                dst.y = src.y;
+                dst.z = src.z;
+                dst.intensity = src.intensity;
+                dst.ring = src.ring;
+                dst.time = src.t * 1e-9f;
+            }
+        }
+        else
+        {
+            ROS_ERROR_STREAM("Unknown sensor type: " << int(sensor));
+            ros::shutdown();
+        }
+
+        // get timestamp
+        cloudHeader = currentCloudMsg.header;
+        timeScanCur = cloudHeader.stamp.toSec();
+        timeScanEnd = timeScanCur + laserCloudIn->points.back().time;
 
         // check dense flag
         if (laserCloudIn->is_dense == false)
@@ -234,15 +262,15 @@ public:
                 ROS_ERROR("Point cloud ring channel not available, please configure your point cloud data!");
                 ros::shutdown();
             }
-        }   
+        }
 
         // check point time
         if (deskewFlag == 0)
         {
             deskewFlag = -1;
-            for (int i = 0; i < (int)currentCloudMsg.fields.size(); ++i)
+            for (auto &field : currentCloudMsg.fields)
             {
-                if (currentCloudMsg.fields[i].name == timeField)
+                if (field.name == "time" || field.name == "t")
                 {
                     deskewFlag = 1;
                     break;
@@ -261,7 +289,7 @@ public:
         std::lock_guard<std::mutex> lock2(odoLock);
 
         // make sure IMU data available for the scan
-        if (imuQueue.empty() || imuQueue.front().header.stamp.toSec() > timeScanCur || imuQueue.back().header.stamp.toSec() < timeScanNext)
+        if (imuQueue.empty() || imuQueue.front().header.stamp.toSec() > timeScanCur || imuQueue.back().header.stamp.toSec() < timeScanEnd)
         {
             ROS_DEBUG("Waiting for IMU data ...");
             return false;
@@ -300,7 +328,7 @@ public:
             if (currentImuTime <= timeScanCur)
                 imuRPY2rosRPY(&thisImuMsg, &cloudInfo.imuRollInit, &cloudInfo.imuPitchInit, &cloudInfo.imuYawInit);
 
-            if (currentImuTime > timeScanNext + 0.01)
+            if (currentImuTime > timeScanEnd + 0.01)
                 break;
 
             if (imuPointerCur == 0){
@@ -383,7 +411,7 @@ public:
         // get end odometry at the end of the scan
         odomDeskewFlag = false;
 
-        if (odomQueue.back().header.stamp.toSec() < timeScanNext)
+        if (odomQueue.back().header.stamp.toSec() < timeScanEnd)
             return;
 
         nav_msgs::Odometry endOdomMsg;
@@ -392,7 +420,7 @@ public:
         {
             endOdomMsg = odomQueue[i];
 
-            if (ROS_TIME(&endOdomMsg) < timeScanNext)
+            if (ROS_TIME(&endOdomMsg) < timeScanEnd)
                 continue;
             else
                 break;
@@ -451,7 +479,7 @@ public:
         // if (cloudInfo.odomAvailable == false || odomDeskewFlag == false)
         //     return;
 
-        // float ratio = relTime / (timeScanNext - timeScanCur);
+        // float ratio = relTime / (timeScanEnd - timeScanCur);
 
         // *posXCur = ratio * odomIncreX;
         // *posYCur = ratio * odomIncreY;
@@ -502,6 +530,10 @@ public:
             thisPoint.z = laserCloudIn->points[i].z;
             thisPoint.intensity = laserCloudIn->points[i].intensity;
 
+            float range = pointDistance(thisPoint);
+            if (range < lidarMinRange || range > lidarMaxRange)
+                continue;
+
             int rowIdn = laserCloudIn->points[i].ring;
             if (rowIdn < 0 || rowIdn >= N_SCAN)
                 continue;
@@ -509,36 +541,32 @@ public:
             if (rowIdn % downsampleRate != 0)
                 continue;
 
-            float horizonAngle = atan2(thisPoint.x, thisPoint.y) * 180 / M_PI;
-
-            static float ang_res_x = 360.0/float(Horizon_SCAN);
-            int columnIdn = -round((horizonAngle-90.0)/ang_res_x) + Horizon_SCAN/2;
-            if (columnIdn >= Horizon_SCAN)
-                columnIdn -= Horizon_SCAN;
-
-            if (columnIdn < 0 || columnIdn >= Horizon_SCAN)
-                continue;
-
-            float range = pointDistance(thisPoint);
+            int columnIdn = -1;
+            if (sensor == SensorType::VELODYNE || sensor == SensorType::OUSTER)
+            {
+                float horizonAngle = atan2(thisPoint.x, thisPoint.y) * 180 / M_PI;
+                static float ang_res_x = 360.0/float(Horizon_SCAN);
+                columnIdn = -round((horizonAngle-90.0)/ang_res_x) + Horizon_SCAN/2;
+                if (columnIdn >= Horizon_SCAN)
+                    columnIdn -= Horizon_SCAN;
+            }
+            else if (sensor == SensorType::LIVOX)
+            {
+                columnIdn = columnIdnCountVec[rowIdn];
+                columnIdnCountVec[rowIdn] += 1;
+            }
             
-            if (range < 1.0)
+            if (columnIdn < 0 || columnIdn >= Horizon_SCAN)
                 continue;
 
             if (rangeMat.at<float>(rowIdn, columnIdn) != FLT_MAX)
                 continue;
 
-            // for the amsterdam dataset
-            // if (range < 6.0 && rowIdn <= 7 && (columnIdn >= 1600 || columnIdn <= 200))
-            //     continue;
-            // if (thisPoint.z < -2.0)
-            //     continue;
+            thisPoint = deskewPoint(&thisPoint, laserCloudIn->points[i].time);
 
-            thisPoint = deskewPoint(&thisPoint, laserCloudIn->points[i].time); // Velodyne
-            // thisPoint = deskewPoint(&thisPoint, (float)laserCloudIn->points[i].t / 1000000000.0); // Ouster
+            rangeMat.at<float>(rowIdn, columnIdn) = range;
 
-            rangeMat.at<float>(rowIdn, columnIdn) = pointDistance(thisPoint);
-
-            int index = columnIdn  + rowIdn * Horizon_SCAN;
+            int index = columnIdn + rowIdn * Horizon_SCAN;
             fullCloud->points[index] = thisPoint;
         }
     }
@@ -572,7 +600,7 @@ public:
     void publishClouds()
     {
         cloudInfo.header = cloudHeader;
-        cloudInfo.cloud_deskewed  = publishCloud(&pubExtractedCloud, extractedCloud, cloudHeader.stamp, lidarFrame);
+        cloudInfo.cloud_deskewed  = publishCloud(pubExtractedCloud, extractedCloud, cloudHeader.stamp, lidarFrame);
         pubLaserCloudInfo.publish(cloudInfo);
     }
 };

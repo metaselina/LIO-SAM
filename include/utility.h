@@ -1,6 +1,7 @@
 #pragma once
 #ifndef _UTILITY_LIDAR_ODOMETRY_H_
 #define _UTILITY_LIDAR_ODOMETRY_H_
+#define PCL_NO_PRECOMPILE 
 
 #include <ros/ros.h>
 
@@ -57,6 +58,8 @@ using namespace std;
 
 typedef pcl::PointXYZI PointType;
 
+enum class SensorType { VELODYNE, OUSTER, LIVOX };
+
 class ParamServer
 {
 public:
@@ -87,11 +90,13 @@ public:
     bool savePCD;
     string savePCDDirectory;
 
-    // Velodyne Sensor Configuration: Velodyne
+    // Lidar Sensor Configuration
+    SensorType sensor;
     int N_SCAN;
     int Horizon_SCAN;
-    string timeField;
     int downsampleRate;
+    float lidarMinRange;
+    float lidarMaxRange;
 
     // IMU
     float imuAccNoise;
@@ -99,6 +104,7 @@ public:
     float imuAccBiasN;
     float imuGyrBiasN;
     float imuGravity;
+    float imuRPYWeight;
     vector<double> extRotV;
     vector<double> extRPYV;
     vector<double> extTransV;
@@ -167,23 +173,46 @@ public:
         nh.param<bool>("lio_sam/savePCD", savePCD, false);
         nh.param<std::string>("lio_sam/savePCDDirectory", savePCDDirectory, "/Downloads/LOAM/");
 
+        std::string sensorStr;
+        nh.param<std::string>("lio_sam/sensor", sensorStr, "");
+        if (sensorStr == "velodyne")
+        {
+            sensor = SensorType::VELODYNE;
+        }
+        else if (sensorStr == "ouster")
+        {
+            sensor = SensorType::OUSTER;
+        }
+        else if (sensorStr == "livox")
+        {
+            sensor = SensorType::LIVOX;
+        }
+        else
+        {
+            ROS_ERROR_STREAM(
+                "Invalid sensor type (must be either 'velodyne' or 'ouster' or 'livox'): " << sensorStr);
+            ros::shutdown();
+        }
+
         nh.param<int>("lio_sam/N_SCAN", N_SCAN, 16);
         nh.param<int>("lio_sam/Horizon_SCAN", Horizon_SCAN, 1800);
-        nh.param<std::string>("lio_sam/timeField", timeField, "time");
         nh.param<int>("lio_sam/downsampleRate", downsampleRate, 1);
+        nh.param<float>("lio_sam/lidarMinRange", lidarMinRange, 1.0);
+        nh.param<float>("lio_sam/lidarMaxRange", lidarMaxRange, 1000.0);
 
         nh.param<float>("lio_sam/imuAccNoise", imuAccNoise, 0.01);
         nh.param<float>("lio_sam/imuGyrNoise", imuGyrNoise, 0.001);
         nh.param<float>("lio_sam/imuAccBiasN", imuAccBiasN, 0.0002);
         nh.param<float>("lio_sam/imuGyrBiasN", imuGyrBiasN, 0.00003);
         nh.param<float>("lio_sam/imuGravity", imuGravity, 9.80511);
+        nh.param<float>("lio_sam/imuRPYWeight", imuRPYWeight, 0.01);
         nh.param<vector<double>>("lio_sam/extrinsicRot", extRotV, vector<double>());
         nh.param<vector<double>>("lio_sam/extrinsicRPY", extRPYV, vector<double>());
         nh.param<vector<double>>("lio_sam/extrinsicTrans", extTransV, vector<double>());
         extRot = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extRotV.data(), 3, 3);
         extRPY = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extRPYV.data(), 3, 3);
         extTrans = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extTransV.data(), 3, 1);
-        extQRPY = Eigen::Quaterniond(extRPY);
+        extQRPY = Eigen::Quaterniond(extRPY).inverse();
 
         nh.param<float>("lio_sam/edgeThreshold", edgeThreshold, 0.1);
         nh.param<float>("lio_sam/surfThreshold", surfThreshold, 0.1);
@@ -253,15 +282,15 @@ public:
     }
 };
 
-
-sensor_msgs::PointCloud2 publishCloud(ros::Publisher *thisPub, pcl::PointCloud<PointType>::Ptr thisCloud, ros::Time thisStamp, std::string thisFrame)
+template<typename T>
+sensor_msgs::PointCloud2 publishCloud(const ros::Publisher& thisPub, const T& thisCloud, ros::Time thisStamp, std::string thisFrame)
 {
     sensor_msgs::PointCloud2 tempCloud;
     pcl::toROSMsg(*thisCloud, tempCloud);
     tempCloud.header.stamp = thisStamp;
     tempCloud.header.frame_id = thisFrame;
-    if (thisPub->getNumSubscribers() != 0)
-        thisPub->publish(tempCloud);
+    if (thisPub.getNumSubscribers() != 0)
+        thisPub.publish(tempCloud);
     return tempCloud;
 }
 
